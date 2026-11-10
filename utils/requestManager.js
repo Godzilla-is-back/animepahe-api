@@ -522,70 +522,100 @@ class RequestManager {
     }
 
     static async fetchApiData(url, params = {}, cookieHeader) {
+        if (!cookieHeader) {
+            throw new CustomError('No upstream session cookie is available', 401);
+        }
+
+        const proxyUrl = Config.proxyEnabled ? Config.getRandomProxy() : null;
+        let httpAgent;
+        let httpsAgent;
+
+        if (proxyUrl) {
+            const { HttpProxyAgent } = await import('http-proxy-agent');
+            const { HttpsProxyAgent } = await import('https-proxy-agent');
+            const formattedProxyUrl = proxyUrl.startsWith('http') ? proxyUrl : `http://${proxyUrl}`;
+            httpAgent = new HttpProxyAgent(formattedProxyUrl);
+            httpsAgent = new HttpsProxyAgent(formattedProxyUrl);
+        }
+
         try {
-            if (!cookieHeader) {
-                throw new CustomError('DDoS-Guard authentication required', 403);
-            }
-            
-            const proxyUrl = Config.proxyEnabled ? Config.getRandomProxy() : null;
-
-            // Build proxy agents for proper authenticated proxy support
-            let httpAgent = undefined;
-            let httpsAgent = undefined;
-            if (proxyUrl) {
-                const { HttpProxyAgent } = await import('http-proxy-agent');
-                const { HttpsProxyAgent } = await import('https-proxy-agent');
-                const formattedProxyUrl = proxyUrl.startsWith('http') ? proxyUrl : 'http://' + proxyUrl;
-                httpAgent = new HttpProxyAgent(formattedProxyUrl);
-                httpsAgent = new HttpsProxyAgent(formattedProxyUrl);
-            }
-
             const response = await axios.get(url, {
-                params: params,
+                params,
                 headers: {
                     'Accept': 'application/json, text/javascript, */*; q=0.01',
                     'Accept-Language': 'en-US,en;q=0.9',
                     'Referer': Config.getUrl('home'),
                     'User-Agent': Config.userAgent,
-                    'Sec-Fetch-*': '?', 
-                    "dnt": "1",
-                    "sec-ch-ua": '"Not A(Brand";v="99", "Microsoft Edge";v="121", "Chromium";v="121"',
-                    "sec-ch-ua-mobile": "?0",
-                    "sec-ch-ua-platform": '"Windows"',
-                    "sec-fetch-dest": "empty",
-                    "sec-fetch-mode": "cors",
-                    "sec-fetch-site": "same-origin",
-                    "x-requested-with": "XMLHttpRequest",
-                    'Cookie': cookieHeader
+                    'X-Requested-With': 'XMLHttpRequest',
+                    'Cookie': cookieHeader,
                 },
                 proxy: false,
                 ...(httpAgent ? { httpAgent } : {}),
-                ...(httpsAgent ? { httpsAgent } : {})
+                ...(httpsAgent ? { httpsAgent } : {}),
+                timeout: Config.requestTimeout,
+                validateStatus: () => true,
             });
 
-            const responseText = typeof response.data === 'string' ? response.data : JSON.stringify(response.data);
-            if (responseText.includes('DDoS-GUARD') || 
-                responseText.includes('checking your browser') ||
-                response.status === 403) {
-                console.log("response: ", responseText);
-                throw new CustomError('DDoS-Guard authentication required, valid cookies required', 403);
+            const contentType = String(response.headers?.['content-type'] || '').toLowerCase();
+            const responseText = typeof response.data === 'string'
+                ? response.data
+                : JSON.stringify(response.data ?? '');
+            const lowerBody = responseText.toLowerCase();
+            const challengeMarkers = [
+                'ddos-guard',
+                'ddos protection',
+                'checking your browser',
+                'verify you are human',
+                'captcha',
+            ];
+            const challengeDetected = challengeMarkers.some(marker => lowerBody.includes(marker));
+
+            if (challengeDetected) {
+                console.warn('[Upstream diagnostic] Challenge/interstitial response received.', JSON.stringify({
+                    status: response.status,
+                    contentType,
+                    bodyLength: responseText.length,
+                }));
+                throw new CustomError('Upstream returned a DDoS-Guard/challenge page; the session was not accepted.', 503);
+            }
+
+            if (response.status < 200 || response.status >= 300) {
+                console.warn('[Upstream diagnostic] Non-success HTTP response.', JSON.stringify({
+                    status: response.status,
+                    contentType,
+                    bodyLength: responseText.length,
+                }));
+                const message = response.status === 403
+                    ? 'Upstream denied the request (HTTP 403); session or access policy may have been rejected.'
+                    : `Upstream request failed with HTTP ${response.status}.`;
+                throw new CustomError(message, response.status);
+            }
+
+            if (contentType.includes('text/html')) {
+                console.warn('[Upstream diagnostic] Expected API data but received HTML.', JSON.stringify({
+                    status: response.status,
+                    contentType,
+                    bodyLength: responseText.length,
+                }));
+                throw new CustomError('Upstream returned an HTML page instead of API data; inspect the upstream page and session.', 502);
             }
 
             return response.data;
         } catch (error) {
-            if (error.response?.status === 407) {
-                const proxyUrl = Config.proxyEnabled ? Config.getRandomProxy() : null;
-                console.error(`[Proxy 407] Proxy authentication failed. Proxy: ${this.maskProxyUrl(proxyUrl)}`);
-                console.error(`[Proxy 407] USE_PROXY=${process.env.USE_PROXY}, PROXIES env length=${(process.env.PROXIES || '').length}`);
-                throw new CustomError('Proxy authentication failed (407). Check proxy credentials in environment.', 407);
+            if (error instanceof CustomError) throw error;
+
+            const upstreamStatus = error.response?.status;
+            if (upstreamStatus) {
+                console.warn('[Upstream diagnostic] Request transport error.', JSON.stringify({
+                    status: upstreamStatus,
+                    code: error.code || null,
+                    message: error.message,
+                }));
+                throw new CustomError(`Upstream request failed with HTTP ${upstreamStatus}.`, upstreamStatus);
             }
-            if (error.response?.status === 403 || error.response?.status === 502 || error.response?.status === 503) {
-                throw new CustomError('DDoS-Guard authentication required, invalid cookies', 403);
-            }
-            if (error.response?.status === 404) {
-                throw new CustomError('Resource not found', 404);
-            }
-            throw error;
+
+            console.error('[Upstream diagnostic] Network/request failure:', error.code || error.message);
+            throw new CustomError(`Could not reach upstream service: ${error.code || error.message}`, 502);
         }
     }
 }
