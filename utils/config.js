@@ -120,14 +120,15 @@ class Config {
 
         // Handle cookies
         if (process.env.COOKIES) {
-            const cookiePattern = /^([^=]+=[^;]+)(; [^=]+=[^;]+)*$/;
-            if (!cookiePattern.test(process.env.COOKIES)) {
+            const cookieHeader = process.env.COOKIES.trim();
+            const cookiePattern = /^([^=;\s]+=[^;]+)(;\s*[^=;\s]+=[^;]+)*$/;
+            if (!cookiePattern.test(cookieHeader)) {
                 console.warn("Invalid cookie format in environment variables");
-            }
-            console.log("Setting cookies from environment variables...", process.env.COOKIES);
-            const cookiesSet = this.setCookies(process.env.COOKIES);
-            if (!cookiesSet) {
+            } else if (!this.setCookies(cookieHeader)) {
                 console.warn("Failed to set cookies from environment variables");
+            } else {
+                // Never print cookie values: deployment logs may be visible to others.
+                console.log("Cookies loaded from environment variables");
             }
         }
 
