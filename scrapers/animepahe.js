@@ -33,6 +33,9 @@ class Animepahe {
     }
 
     async needsCookieRefresh() {
+        // Explicitly configured cookies take precedence over the temporary cookie file.
+        if (Config.cookies) return false;
+
         try {
             const cookieData = JSON.parse(await fs.readFile(this.cookiesPath, 'utf8'));
             
@@ -111,7 +114,7 @@ class Animepahe {
     }
 
     async getCookies(userProvidedCookies = null) {
-        // If user provided cookies directly, use them
+        // Explicit per-request cookies have the highest priority.
         if (userProvidedCookies) {
             if (typeof userProvidedCookies === 'string' && userProvidedCookies.trim()) {
                 console.log('Using user-provided cookies');
@@ -120,6 +123,12 @@ class Animepahe {
             } else {
                 throw new CustomError('Invalid user-provided cookies format', 400);
             }
+        }
+
+        // Use COOKIES from the deployment environment before attempting browser
+        // initialization or reading a potentially stale /tmp cookie file.
+        if (Config.cookies && Config.cookies.trim()) {
+            return Config.cookies.trim();
         }
 
         let cookieData;
@@ -147,18 +156,21 @@ class Animepahe {
         return cookieHeader;
     }
 
-    async fetchApiData(endpoint, params = {}, userProvidedCookies = null) {
+    async fetchApiData(endpoint, params = {}, userProvidedCookies = null, hasRetried = false) {
         try {
             const cookieHeader = await this.getCookies(userProvidedCookies);
             const url = new URL(endpoint, Config.getUrl('home')).toString();
             return await RequestManager.fetchApiData(url, params, cookieHeader);
         } catch (error) {
-            // Only retry with automatic cookies if user didn't provide cookies
-            if (!userProvidedCookies && (error.response?.status === 401 || error.response?.status === 403)) {
+            // CustomError exposes statusCode (not response.status). Retry automatic
+            // cookie acquisition at most once; never replace explicitly supplied cookies.
+            const statusCode = error.statusCode || error.response?.status;
+            const hasExplicitCookies = Boolean(userProvidedCookies || Config.cookies);
+            if (!hasExplicitCookies && !hasRetried && (statusCode === 401 || statusCode === 403)) {
                 await this.refreshCookies();
-                return this.fetchApiData(endpoint, params, userProvidedCookies);
+                return this.fetchApiData(endpoint, params, userProvidedCookies, true);
             }
-            throw new CustomError(error.message || 'Failed to fetch API data', error.response?.status || 503);
+            throw new CustomError(error.message || 'Failed to fetch API data', statusCode || 503);
         }
     }
 
