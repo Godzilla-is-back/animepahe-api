@@ -54,61 +54,81 @@ class Animepahe {
         this.isRefreshingCookies = true;
 
         let browser = this.activeBrowser;
+        let context;
 
         try {
             if (!browser) {
                 browser = await launchBrowser();
                 console.log('Browser launched successfully');
-                this.activeBrowser = browser; // Store the browser instance
+                this.activeBrowser = browser;
             }
 
-            const context = await browser.newContext();
+            context = await browser.newContext();
             const page = await context.newPage();
 
-            // Add stealth plugin
-            await context.addInitScript(() => {
-                Object.defineProperty(navigator, 'webdriver', { get: () => false });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                const originalQuery = window.navigator.permissions.query;
-                window.navigator.permissions.query = (parameters) =>
-                parameters.name === 'notifications'
-                    ? Promise.resolve({ state: Notification.permission })
-                    : originalQuery(parameters);
+            console.log('Navigating to upstream homepage for cookie acquisition...');
+            const response = await page.goto(Config.getUrl('home'), {
+                waitUntil: 'domcontentloaded',
+                timeout: 30000,
             });
 
-            console.log('Navigating to URL...');
-            await page.goto(Config.getUrl('home'), {
-                waitUntil: 'networkidle',
-                timeout: 30000, 
-            });
+            // Do not treat the mere presence of cookies as a successful session.
+            // A challenge/error page can also set cookies. Detect it and report it
+            // rather than attempting to circumvent the upstream access controls.
+            await page.waitForTimeout(1500);
+            const pageInfo = await page.evaluate(() => ({
+                title: document.title || '',
+                text: (document.body?.innerText || '').slice(0, 4000),
+                url: window.location.href,
+            }));
+            const pageText = `${pageInfo.title} ${pageInfo.text} ${pageInfo.url}`.toLowerCase();
+            const challengeMarkers = [
+                'ddos-guard',
+                'ddos protection',
+                'checking your browser',
+                'please wait',
+                'verify you are human',
+                'captcha',
+                'access denied',
+            ];
+            const challengeDetected = challengeMarkers.some(marker => pageText.includes(marker));
+            const upstreamStatus = response?.status() ?? null;
 
-            // Check for DDoS-Guard challenge
-            await page.waitForTimeout(2000);
-            const isChallengeActive = await page.$('#ddg-cookie');
-            if (isChallengeActive) {
-                console.log('Solving DDoS-Guard challenge...');
-                await page.waitForSelector('#ddg-cookie', { state: 'hidden', timeout: 30000 });
+            console.log('[Cookie acquisition diagnostics]', JSON.stringify({
+                upstreamStatus,
+                finalUrl: pageInfo.url,
+                pageTitle: pageInfo.title,
+                challengeDetected,
+            }));
+
+            if (challengeDetected || (upstreamStatus && upstreamStatus >= 400)) {
+                throw new CustomError(
+                    `Upstream homepage did not provide a normal page (HTTP ${upstreamStatus ?? 'unknown'}; challenge=${challengeDetected}). Automatic cookie acquisition was not successful.`,
+                    503
+                );
             }
 
-            const cookies = await context.cookies();
+            const cookies = await context.cookies(Config.getUrl('home'));
             if (!cookies || cookies.length === 0) {
-                throw new CustomError('No cookies found after page load', 503);
+                throw new CustomError('Upstream homepage loaded but returned no cookies', 503);
             }
 
-            const cookieData = {
-                timestamp: Date.now(),
-                cookies,
-            };
-
+            const cookieData = { timestamp: Date.now(), cookies };
             await fs.mkdir(path.dirname(this.cookiesPath), { recursive: true });
             await fs.writeFile(this.cookiesPath, JSON.stringify(cookieData, null, 2));
 
-            console.log('Cookies refreshed successfully');
+            console.log('[Cookie acquisition] Candidate cookies saved; upstream API acceptance has not yet been verified.', JSON.stringify({
+                cookieCount: cookies.length,
+                cookieNames: cookies.map(cookie => cookie.name),
+            }));
         } catch (error) {
-            console.error('Cookie refresh error:', error);
-            throw new CustomError(`Failed to refresh cookies: ${error.message}`, 503);
+            console.error('Cookie acquisition failed:', error.message);
+            if (error instanceof CustomError) throw error;
+            throw new CustomError(`Cookie acquisition failed: ${error.message}`, 503);
         } finally {
+            if (context) {
+                try { await context.close(); } catch (_) { /* ignore cleanup errors */ }
+            }
             this.isRefreshingCookies = false;
         }
     }
